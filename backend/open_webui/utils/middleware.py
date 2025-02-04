@@ -896,7 +896,7 @@ async def process_chat_response(
         if message:
             messages = get_message_list(message_map, message.get("id"))
 
-            if tasks:
+            if tasks and messages:
                 if TASKS.TITLE_GENERATION in tasks:
                     if tasks[TASKS.TITLE_GENERATION]:
                         res = await generate_title(
@@ -1085,6 +1085,14 @@ async def process_chat_response(
         task_id = str(uuid4())  # Create a unique task ID.
         model_id = form_data.get("model", "")
 
+        Chats.upsert_message_to_chat_by_id_and_message_id(
+            metadata["chat_id"],
+            metadata["message_id"],
+            {
+                "model": model_id,
+            },
+        )
+
         # Handle as a background task
         async def post_response_handler(response, events):
             def serialize_content_blocks(content_blocks, raw=False):
@@ -1102,9 +1110,15 @@ async def process_chat_response(
                         reasoning_duration = block.get("duration", None)
 
                         if reasoning_duration:
-                            content = f'{content}<details type="reasoning" done="true" duration="{reasoning_duration}">\n<summary>Thought for {reasoning_duration} seconds</summary>\n{reasoning_display_content}\n</details>\n'
+                            if raw:
+                                content = f'{content}<{block["tag"]}>{block["content"]}</{block["tag"]}>\n'
+                            else:
+                                content = f'{content}<details type="reasoning" done="true" duration="{reasoning_duration}">\n<summary>Thought for {reasoning_duration} seconds</summary>\n{reasoning_display_content}\n</details>\n'
                         else:
-                            content = f'{content}<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n{reasoning_display_content}\n</details>\n'
+                            if raw:
+                                content = f'{content}<{block["tag"]}>{block["content"]}</{block["tag"]}>\n'
+                            else:
+                                content = f'{content}<details type="reasoning" done="false">\n<summary>Thinking…</summary>\n{reasoning_display_content}\n</details>\n'
 
                     elif block["type"] == "code_interpreter":
                         attributes = block.get("attributes", {})
@@ -1115,11 +1129,14 @@ async def process_chat_response(
                             output = html.escape(json.dumps(output))
 
                             if raw:
-                                content = f'{content}<details type="code_interpreter" done="true" output="{output}">\n<summary>Analyzed</summary>\n```{lang}\n{block["content"]}\n```\n```output\n{output}\n```\n</details>\n'
+                                content = f'{content}<code_interpreter type="code" lang="{lang}">\n{block["content"]}\n</code_interpreter>\n```output\n{output}\n```\n'
                             else:
                                 content = f'{content}<details type="code_interpreter" done="true" output="{output}">\n<summary>Analyzed</summary>\n```{lang}\n{block["content"]}\n```\n</details>\n'
                         else:
-                            content = f'{content}<details type="code_interpreter" done="false">\n<summary>Analyzing...</summary>\n```{lang}\n{block["content"]}\n```\n</details>\n'
+                            if raw:
+                                content = f'{content}<code_interpreter type="code" lang="{lang}">\n{block["content"]}\n</code_interpreter>\n'
+                            else:
+                                content = f'{content}<details type="code_interpreter" done="false">\n<summary>Analyzing...</summary>\n```{lang}\n{block["content"]}\n```\n</details>\n'
 
                     else:
                         block_content = str(block["content"]).strip()
@@ -1350,6 +1367,15 @@ async def process_chat_response(
                         if not content_blocks[-1]["content"]:
                             content_blocks.pop()
 
+                    await event_emitter(
+                        {
+                            "type": "chat:completion",
+                            "data": {
+                                "content": serialize_content_blocks(content_blocks),
+                            },
+                        }
+                    )
+
                     if response.background:
                         await response.background()
 
@@ -1365,6 +1391,7 @@ async def process_chat_response(
                     retries += 1
                     log.debug(f"Attempt count: {retries}")
 
+                    output = ""
                     try:
                         if content_blocks[-1]["attributes"].get("type") == "code":
                             output = await event_caller(
